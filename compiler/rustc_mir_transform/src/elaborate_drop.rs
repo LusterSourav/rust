@@ -15,6 +15,7 @@ use tracing::{debug, instrument};
 
 use crate::coroutine::CTX_ARG;
 use crate::patch::MirPatch;
+use crate::util::place_unalignment;
 
 /// Describes how/if a value should be dropped.
 #[derive(Debug)]
@@ -351,6 +352,24 @@ where
         // OR call async_drop_in_place(pin_obj.pointer)
         let pin_adt_def = tcx.adt_def(tcx.require_lang_item(LangItem::Pin, span));
         let pin_obj_ty = Ty::new_adt(tcx, pin_adt_def, tcx.mk_args(&[obj_ref_ty.into()]));
+        // If the place is unaligned (e.g., a field of a repr(packed) struct), move it to a
+        // local temporary before taking a mutable reference, to avoid UB.
+        let unaligned = place_unalignment(tcx, self.elaborator.body(),
+            ty::TypingEnv::post_analysis(tcx, self.elaborator.body().source.def_id()),
+            self.place).is_some();
+        let (temp, place) = if unaligned {
+            let place_ty = self.place.ty(self.elaborator.body(), self.tcx()).ty;
+            let temp = patch.new_temp(place_ty, self.source_info.span);
+            // Live‑range start
+            patch.add_statement(self.source_info.span, Statement::StorageLive(temp));
+            // Move original place into temp
+            patch.add_assign(self.source_info.span, Place::from(temp),
+                Rvalue::Use(Operand::Move(self.place), WithRetag::Yes));
+            (Some(temp), Place::from(temp))
+        } else {
+            (None, self.place)
+        };
+        // Where we store the result of Pin<&drop_ty>::new_unchecked(&mut place).
         // Where we store the result of Pin<&drop_ty>::new_unchecked(&mut place).
         let pin_obj_local = self.new_temp(pin_obj_ty);
         let drop_arg = if call_destructor_only {
@@ -373,6 +392,10 @@ where
                 fn_span: self.source_info.span,
             },
         );
+        // StorageDead for the temporary moved place, since the async drop has taken ownership.
+        if let Some(temp) = temp {
+            patch.add_statement(self.source_info.span, Statement::StorageDead(temp));
+        }
 
         // #1:pin_obj_bb >>> call Pin<ObjTy>::new_unchecked(&mut obj)
         let obj_ref_place = Place::from(self.new_temp(obj_ref_ty));
