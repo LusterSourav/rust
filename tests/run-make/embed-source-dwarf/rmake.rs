@@ -64,7 +64,7 @@ fn main() {
         }
     }
 
-    // Sources of other crates, such as std, may also be embedded, so only
-    // check the source of the crate under test.
+    dbg!(&sources);
+    assert_eq!(sources.len(), 1);
     assert_eq!(sources.get("main.rs").unwrap(), "// hello\nfn main() {}\n");
 }
